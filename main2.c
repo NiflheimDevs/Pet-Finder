@@ -17,6 +17,7 @@
 #include "ril.h"
 #include "ril_network.h"
 #include "ril_gps.h"
+#include "ril_location.h"
 //gprs-related apis
 #include "ql_gprs.h"
 #include "ql_socket.h"
@@ -100,6 +101,10 @@ static void Timer_Callback(u32 timerId, void* param){
     }
 }
 
+
+/*===========================================================================
+ * STATE MACHINE ENGINE
+ *===========================================================================*/
 static void state_machine_process(){
     s32 ret;
     s32 gsm_state = 0;
@@ -173,7 +178,7 @@ static void state_machine_process(){
             }
             break;
         case STATE_READY_PUBLISH: 
-        ret = RIL_NW_GetGPRSState(&gprs_state);
+            ret = RIL_NW_GetGPRSState(&gprs_state);
             if (gprs_state != NW_STAT_REGISTERED && gprs_state != NW_STAT_REGISTERED_ROAMING)
             {
                 Ql_Debug_Trace("[PF] Connection lost! Pausing publication loop...\r\n");
@@ -186,8 +191,98 @@ static void state_machine_process(){
 }
 
 
+
+/*===========================================================================
+ * TELEMETRY ACQUISITION & TRANSMISSION
+ *===========================================================================*/
+static void acquire_and_send_location(){
+    u8 gps_buffer[128] = {0};
+    char payload[150] = {0};
+    float latitude = 0.0;
+    float longitude = 0.0;
+    bool has_fix = FALSE;
+    s32 ret;
+
+    Ql_Debug_Trace("Acquiring GPS location\r\n");
+    ret = RIL_GPS_Read(1, gps_buffer);
+    if(ret == RIL_AT_SUCCESS){
+        char *ptr = Ql_strstr((char*)gps_buffer, "+QGPSLOC:");
+        if(ptr != NULL){
+            char time_buf[16], hdop_buf[16], alt_buf[16], fix_buf[16];
+            // Safe parse utility function provided by ril_system
+            // Extract Latitude & Longitude tokens out of the response
+            s32 parsed = Ql_sscanf(ptr, "+QGPSLOC: %[^,],%f,%f", time_buf, &latitude, &longitude);
+            if (parsed >= 3 && latitude != 0.0 && longitude != 0.0)
+            {
+                has_fix = TRUE;
+                Ql_Debug_Trace("[PF] GPS Fix acquired successfully.\r\n");
+            }
+        }
+    }
+
+    // Fall back to Cell-Tower Positioning (QuecLocator) if GPS lacks line of sight
+    if (!has_fix)
+    {
+        ST_LocInfo cell_loc;
+        Ql_memset(&cell_loc, 0, sizeof(ST_LocInfo));
+        
+        Ql_Debug_Trace("[PF] GPS signal weak/indoors. Querying cellular cell towers...\r\n");
+        ret = RIL_GetLocation_Ex(&cell_loc);
+        if (ret == RIL_AT_SUCCESS)
+        {
+            latitude = cell_loc.latitude;
+            longitude = cell_loc.longitude;
+            has_fix = TRUE;
+            Ql_Debug_Trace("[PF] Cell-Tower location fallback successful.\r\n");
+        }
+        else
+        {
+            Ql_Debug_Trace("[PF] Failed to acquire localization from all sensors (Error: %d).\r\n", ret);
+        }
+    }
+
+    // Publish telemetry data if location acquisition was successful
+    if (has_fix)
+    {
+        m_mqtt_msg_id++;
+        if (m_mqtt_msg_id > 65535) m_mqtt_msg_id = 1;
+
+        // Package measurements into a standardized JSON packet
+        Ql_sprintf(payload, "{\"clientId\":\"%s\",\"lat\":%.6f,\"lng\":%.6f}", 
+                   MQTT_CLIENT_ID, latitude, longitude);
+
+        Ql_Debug_Trace("[PF] Transmitting packet to topic '%s': %s\r\n", MQTT_PUB_TOPIC, payload);
+
+        // Publish to MQTT Broker using QoS 1 (At Least Once delivery guarantee)
+        ret = RIL_MQTT_QMTPUB(m_mqtt_conn_id, m_mqtt_msg_id, QOS1_AT_LEASET_ONCE, 0, 
+                             (u8*)MQTT_PUB_TOPIC, Ql_strlen(payload), (u8*)payload);
+                             
+        if (ret != RIL_AT_SUCCESS)
+        {
+            Ql_Debug_Trace("[PF] MQTT Publish failure detected (Error: %d). Forcing reconnection...\r\n", ret);
+            RIL_MQTT_QMTCLOSE(m_mqtt_conn_id);
+            m_current_state = STATE_MQTT_OPENING;
+        }
+    }
+
+
+}
+
+
+
+
 void proc_main_task(s32 taskId){
     ST_MSG msg;
+
+    Ql_Debug_Trace("Booting pet Finder");
+
+    Ql_Timer_Register(TIMER_STATE_MACHINE_ID, Timer_Callback, NULL);
+    Ql_Timer_Register(TIMER_PUBLISH_ID, Timer_Callback, NULL);
+    Ql_Timer_Register(TIMER_RESET_ID, Timer_Callback, NULL);
+
+    Ql_Timer_Start(TIMER_STATE_MACHINE_ID, 2000, TRUE);
+
+    Ql_Timer_Start(TIMER_RESET_ID, RESET_INTERVAL_MS, FALSE);   //should be repeatedly
 
     while(1)
     {
@@ -197,6 +292,7 @@ void proc_main_task(s32 taskId){
             case MSG_ID_RIL_READY:
                 Ql_Debug_Trace("RIL is ready\r\n");
                 Ql_RIL_Initialize();
+                m_current_state = STATE_WAIT_SIM;
                 break;
             case MSG_ID_URC_INDICATION:
                 {
@@ -206,8 +302,9 @@ void proc_main_task(s32 taskId){
                         case URC_SIM_CARD_STATE_IND:
                             {
                                 Ql_Debug_Trace("Sim Status : %d\r\n", msg.param2);
-                                if(SIM_STAT_READY == msg.param2){
-                                    // This is where we will start the state machine later                                }
+                                if(SIM_STAT_READY == msg.param2 && m_current_state < STATE_WAIT_SIM){
+                                    // This is where we will start the state machine later
+                                    m_current_state = STATE_WAIT_SIM;                                
                                 }
                             }
                             break;
@@ -224,7 +321,7 @@ void proc_main_task(s32 taskId){
                     }
                 }
                 break;
-            default:
+                default:
                 break;
         }
         
