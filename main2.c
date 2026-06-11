@@ -11,6 +11,7 @@
 
 #ifndef __PETFINDER__   //have to be changed to ifdef(but the coloring changes)
 
+#include "ql_type.h"
 //RIL feature
 #include "custom_feature_def.h"
 #include "ril.h"
@@ -27,59 +28,78 @@
 #include "ql_trace.h"
 //mqtt
 #include "ril_mqtt.h"
+//timer
+#include "ql_timer.h"
 
 
+/*===========================================================================
+ * [2] Configuration - everything you might want to change is here
+ *==========================================================================*/
+#define APN      ""
+#define APN_USER   ""
+#define APN_PASS   ""
+
+//MQTT Broker setting
+#define MQTT_HOST ""
+#define MQTT_PORT 1883
+#define MQTT_CLIENT_ID      "petfinder-01"       /* must be unique on broker*/
+#define MQTT_USERNAME       NULL                 /* NULL,NULL = anonymous   */
+#define MQTT_PASSWORD       NULL
+#define MQTT_PUB_TOPIC      "petfinder/01/loc"
+
+#define PUBLISH_INTERVAL_MS 10 * 1000
+#define RESET_INTERVAL_MS   24 * 60 * 60 * 1000 /* 24 h reboot */
+
+
+// Timer IDs
+#define TIMER_STATE_MACHINE_ID   101
+#define TIMER_PUBLISH_ID         102
+#define TIMER_RESET_ID           103
 
 
 /*===========================================================================
  * STATE MACHINE
  *===========================================================================*/
 typedef enum {
-    STATE_WAIT_GPRS,    /* Waiting for GPRS to register + PDP to activate */
-    STATE_CFG_MQTT,     /* Configure MQTT client (version, recv-len) */
-    STATE_OPEN_MQTT,    /* Open TCP socket to broker */
-    STATE_CONN_MQTT,    /* Send MQTT CONNECT packet */
-    STATE_SUB_MQTT,     /* Subscribe to topic */
-    STATE_IDLE,         /* Connected — publish on timer, receive on callback */
-    STATE_RECONNECTING  /* Tearing down and restarting from OPEN */
+    STATE_BOOT = 0,
+    STATE_WAIT_SIM,
+    STATE_WAIT_GSM,
+    STATE_WAIT_GPRS,
+    STATE_PDP_ACTIVATING,
+    STATE_MQTT_OPENING,
+    STATE_MQTT_CONNECTING,
+    STATE_READY_PUBLISH
 } Enum_AppState;
 
+static Enum_AppState m_current_state = STATE_BOOT;
+static u32 m_publish_timer_interval = PUBLISH_INTERVAL_MS;
+static Enum_ConnectID m_mqtt_conn_id = ConnectID_0; // Usually 0 for first profile
+static u32 m_mqtt_msg_id = 0;
 
 
+static void state_machine_process();
+static void acquire_and_send_location();
 
+static void Timer_Callback(u32 timerId, void* param){
+    switch(timerId){
+        case TIMER_STATE_MACHINE_ID:
+            state_machine_process();
+            break;
+        case TIMER_PUBLISH_ID:
+            if(m_current_state == STATE_READY_PUBLISH){
+                acquire_and_send_location();
+            }
+            break;
+        case TIMER_RESET_ID:
+            //24 hours maintenance reboot for longterm stability
+            Ql_Debug_Trace("24-hour timer expired, resetting module\r\n");
+            Ql_Reset(0);
+            break;
+        default:
+            break;
+    }
+}
 
-//APN Config
-#define APN      ""
-#define USERID   ""
-#define PASSWD   ""
-
-//MQTT Broker setting
-#define HOST_NAME ""
-#define HOST_PORT 1883
-
-//reset In order to keep a stable running state
-#define RESET_INTERVAL_MS  24 * 60 * 60 * 1000
-
-//mqtt Client Credentials(for now i wont use)
-u8 clientID[] = "\0";
-u8 username[] = "\0";
-u8 password[] = "\0";
-
-
-u8 topic[] = "\0";
-u8 data[]  = "\0";
-
-//Message ID
-u32 pub_message_id = 0;
-u32 sub_message_id = 0;
-
-//Timer So we dont need blocking loop
-#define MQTT_TIMER_ID         0x200
-#define MQTT_TIMER_PERIOD     500   /* ms */
-
-/* URC parameter pointer — filled by the modem for each async event */
-MQTT_Urc_Param_t*	  mqtt_urc_param_ptr = NULL;
-ST_MQTT_topic_info_t  mqtt_topic_info_t;
 
 void proc_main_task(s32 taskId){
     ST_MSG msg;
@@ -97,6 +117,7 @@ void proc_main_task(s32 taskId){
                 {
                     switch(msg.param1)
                     {
+                        //simcard state kick off the timer once sim is Ready
                         case URC_SIM_CARD_STATE_IND:
                             {
                                 Ql_Debug_Trace("Sim Status : %d\r\n", msg.param2);
