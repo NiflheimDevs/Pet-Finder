@@ -100,6 +100,91 @@ static void Timer_Callback(u32 timerId, void* param){
     }
 }
 
+static void state_machine_process(){
+    s32 ret;
+    s32 gsm_state = 0;
+    s32 gprs_state = 0;
+
+    switch(m_current_state){
+        case STATE_BOOT:
+            break;
+        case STATE_WAIT_SIM:
+            ret = RIL_SIM_GetSimState(&gsm_state);
+            if(RIL_AT_SUCCESS == ret && SIM_STAT_READY == gsm_state){
+                Ql_Debug_Trace("SIM is ready\r\n");
+                m_current_state = STATE_WAIT_GSM;
+            }
+            break;
+        case STATE_WAIT_GSM:
+            ret = RIL_NW_GetGSMState(&gsm_state);
+            if(gsm_state == NW_STAT_REGISTERED || gsm_state == NW_STAT_REGISTERED_ROAMING){
+                Ql_Debug_Trace("GSM network registered\r\n");
+                RIL_GPS_Open(1);        // Activate GPS engine in background
+                m_current_state = STATE_WAIT_GPRS;
+            }
+            break;
+        case STATE_WAIT_GPRS:
+            ret = RIL_NW_GetGPRSState(&gprs_state);
+            if(gprs_state == NW_STAT_REGISTERED || gprs_state == NW_STAT_REGISTERED_ROAMING){
+                Ql_Debug_Trace("GPRS network registered\r\n");
+                // Activate PDP context with APN settings
+                RIL_NW_SetGPRSContext(0);
+                RIL_NW_SetAPN(1, APN, APN_USER, APN_PASS);
+                m_current_state = STATE_PDP_ACTIVATING;
+            }
+            else if (gprs_state == NW_STAT_NOT_REGISTERED)
+            {
+                // Fall back to GSM check if cellular registration drops completely
+                m_current_state = STATE_WAIT_GSM;
+            }
+            break;
+        case STATE_PDP_ACTIVATING:
+            Ql_Debug_Trace("Activating PDP context\r\n");
+            ret = RIL_NW_OpenPDPContext();
+            if(ret == RIL_AT_SUCCESS){
+                Ql_Debug_Trace("PDP context activated\r\n");
+                m_current_state = STATE_MQTT_OPENING;
+            }
+            else{
+                Ql_Debug_Trace("Failed to activate PDP context\r\n");
+            }
+            break;
+        case STATE_MQTT_OPENING:
+            ret = RIL_MQTT_QMTOPEN(m_mqtt_conn_id, MQTT_HOST, MQTT_PORT);   //do i need teo cast??
+            if(ret == RIL_AT_SUCCESS){
+                Ql_Debug_Trace("MQTT socket opened\r\n");
+                m_current_state = STATE_MQTT_CONNECTING;
+            }
+            else{
+                Ql_Debug_Trace("Failed to open MQTT socket\r\n");
+            }
+            break;
+        case STATE_MQTT_CONNECTING:
+            ret = RIL_MQTT_QMTCONN(m_mqtt_conn_id, MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD);    //need cast?
+            if(ret == RIL_AT_SUCCESS){
+                Ql_Debug_Trace("MQTT CONNECT sent\r\n");
+                m_current_state = STATE_READY_PUBLISH;
+                Ql_Timer_Start(TIMER_PUBLISH_ID, m_publish_timer_interval, TRUE); // Start publish timer
+            }
+            else{
+                Ql_Debug_Trace("Failed to send MQTT CONNECT\r\n");
+                RIL_MQTT_QMTCLOSE(m_mqtt_conn_id);
+                m_current_state = STATE_MQTT_OPENING;
+            }
+            break;
+        case STATE_READY_PUBLISH: 
+        ret = RIL_NW_GetGPRSState(&gprs_state);
+            if (gprs_state != NW_STAT_REGISTERED && gprs_state != NW_STAT_REGISTERED_ROAMING)
+            {
+                Ql_Debug_Trace("[PF] Connection lost! Pausing publication loop...\r\n");
+                Ql_Timer_Stop(TIMER_PUBLISH_ID);
+                RIL_MQTT_QMTCLOSE(m_mqtt_conn_id);
+                m_current_state = STATE_WAIT_GPRS;
+            }
+            break;
+    }
+}
+
 
 void proc_main_task(s32 taskId){
     ST_MSG msg;
