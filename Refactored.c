@@ -112,7 +112,125 @@ static AppState      m_backoff_next     = STATE_MQTT_OPENING;
 static u8            m_backoff_ticks    = 0;   // each tick = STATE_MACHINE_INTERVAL_MS
 
 /*===========================================================================
- * EOF – forward declarations and logic will be added in the next parts
+ * [6] Forward declarations
+ *=========================================================================*/
+static void state_machine_tick(void);
+static void acquire_and_send_location(void);
+static void teardown_mqtt(void);
+static void teardown_pdp(void);
+static void enter_backoff(u8 ticks, AppState next_state);
+
+/*===========================================================================
+ * [7] Helper functions
+ *=========================================================================*/
+
+/*---------------------------------------------------------------------------
+ * enter_backoff()
+ *
+ * Call this from any failure point. The state machine will sit in
+ * STATE_BACKOFF for (ticks x STATE_MACHINE_INTERVAL_MS) milliseconds,
+ * then automatically flip to next_state.
+ *
+ * Examples:
+ *   enter_backoff(5,  STATE_MQTT_OPENING);  //  5s cooldown, retry MQTT
+ *   enter_backoff(15, STATE_WAIT_GPRS);     // 15s cooldown, wait for GPRS
+ *-------------------------------------------------------------------------*/
+static void enter_backoff(u8 ticks, AppState next_state)
+{
+    Ql_Debug_Trace("[BACKOFF] waiting %d ticks before state %d\r\n",
+                   ticks, (s32)next_state);
+    m_backoff_ticks = ticks;
+    m_backoff_next  = next_state;
+    m_state         = STATE_BACKOFF;
+}
+
+/*---------------------------------------------------------------------------
+ * teardown_mqtt()
+ *
+ * Gracefully tears down the MQTT layer only - PDP context stays alive.
+ * Always call this before teardown_pdp(), never skip straight to QMTCLOSE.
+ *
+ * Sequence: stop publish timer -> QMTDISC (polite bye to broker) ->
+ *           flip to STATE_MQTT_DISCONNECTING so the state machine tick
+ *           can follow up with QMTCLOSE once DISC is done.
+ *-------------------------------------------------------------------------*/
+static void teardown_mqtt(void)
+{
+    Ql_Debug_Trace("[MQTT] tearing down MQTT layer\r\n");
+ 
+    // Stop the publish loop immediately - no more publishes during teardown
+    Ql_Timer_Stop(TIMER_ID_PUBLISH);
+ 
+    // Ask broker to close the session cleanly (sends MQTT DISCONNECT packet)
+    // We don't check the return value here - if DISC fails we still proceed
+    // to CLOSE, the broker will time us out on its end anyway
+    RIL_MQTT_QMTDISC(m_conn_id);
+ 
+    m_state = STATE_MQTT_DISCONNECTING;
+}
+
+/*---------------------------------------------------------------------------
+ * teardown_pdp()
+ *
+ * Tears down everything: MQTT first, then the PDP context underneath.
+ * After this the module has no data connectivity - state machine will
+ * wait for GPRS re-registration before climbing back up.
+ *-------------------------------------------------------------------------*/
+static void teardown_pdp(void)
+{
+    Ql_Debug_Trace("[PDP] tearing down PDP context\r\n");
+ 
+    // Clean up MQTT first (stops publish timer, sends DISC)
+    teardown_mqtt();
+ 
+    // Close the PDP context - module loses IP connectivity here
+    RIL_NW_ClosePDPContext();
+ 
+    // Increment failure counter and escalate if threshold is reached
+    m_pdp_fail_count++;
+    if (m_pdp_fail_count >= MAX_PDP_FAILURES)
+    {
+        Ql_Debug_Trace("[PDP] too many PDP failures, resetting module\r\n");
+        Ql_Reset(0);
+    }
+ 
+    enter_backoff(15, STATE_WAIT_GPRS); // 15s before trying GPRS again
+}
+
+/*===========================================================================
+ * [8] Timer callback
+ *
+ * Single handler for all three timers. Keeps the callback table simple -
+ * one registration, one place to read.
+ *=========================================================================*/
+static void Timer_Callback(u32 timerId, void *param)
+{
+    switch (timerId)
+    {
+    case TIMER_ID_STATE_MACHINE:
+        state_machine_tick();
+        break;
+ 
+    case TIMER_ID_PUBLISH:
+        // Only fire location work when we are actually connected
+        if (m_state == STATE_PUBLISHING)
+        {
+            acquire_and_send_location();
+        }
+        break;
+ 
+    case TIMER_ID_RESET:
+        // 24-hour maintenance reboot - keeps the module fresh long-term
+        Ql_Debug_Trace("[RESET] 24-hour timer expired, rebooting\r\n");
+        Ql_Reset(0);
+        break;
+ 
+    default:
+        break;
+    }
+}
+/*===========================================================================
+ * EOF - state_machine_tick() and acquire_and_send_location() in next parts
  *=========================================================================*/
 
 #endif /* __PETFINDER__ */
