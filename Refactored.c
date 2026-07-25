@@ -528,8 +528,200 @@ static void state_machine_tick(void)
 }
  
 /*===========================================================================
- * EOF - acquire_and_send_location() and proc_main_task() in next parts
+ * [10] Location acquisition and MQTT publish
+ *
+ * Called every PUBLISH_INTERVAL_MS by TIMER_ID_PUBLISH.
+ * Only runs when m_state == STATE_PUBLISHING (enforced in Timer_Callback).
+ *
+ * Strategy:
+ *   1. Try GPS first  - best accuracy, needs open sky
+ *   2. Fall back to cell tower positioning (RIL_GetLocation_Ex) if GPS
+ *      has no fix - coarser but works indoors and in urban canyons
+ *   3. If both fail - increment failure counter, escalate if needed
+ *
+ * Payload format:
+ *   {"clientId":"petfinder-01","lat":52.123456,"lng":4.123456,"src":"gps"}
+ *   {"clientId":"petfinder-01","lat":52.123456,"lng":4.123456,"src":"cell"}
  *=========================================================================*/
-
-
+ 
+// RMC sentence from GPS gives us: time, status, lat, lon, speed, heading
+// Buffer needs to hold the full NMEA sentence back from the modem
+#define GPS_READ_ITEM       "RMC"
+#define GPS_BUFFER_LEN      256
+#define PAYLOAD_BUFFER_LEN  160   // enough for the JSON + some headroom
+ 
+static void acquire_and_send_location(void)
+{
+    u8   gps_buf[GPS_BUFFER_LEN]     = {0};
+    char payload[PAYLOAD_BUFFER_LEN] = {0};
+    float latitude  = 0.0f;
+    float longitude = 0.0f;
+    bool  has_fix   = FALSE;
+    const char *src = "gps";
+    s32 ret;
+ 
+    /*----------------------------------------------------------------------
+     * Step 1 — Try GPS
+     * RIL_GPS_Read returns the raw NMEA RMC sentence in gps_buf.
+     * An RMC sentence looks like:
+     *   $GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A
+     *                  ^ 'A' = active (valid fix), 'V' = void (no fix)
+     *                          ^ lat ddmm.mmm  ^ lon dddmm.mmm
+     *
+     * We check the status field first - if it is 'V' the coordinates are
+     * garbage and we must not use them.
+     *--------------------------------------------------------------------*/
+    Ql_Debug_Trace("[LOC] reading GPS\r\n");
+    ret = RIL_GPS_Read((u8 *)GPS_READ_ITEM, gps_buf);
+ 
+    if (ret == RIL_AT_SUCCESS && Ql_strlen((char *)gps_buf) > 0)
+    {
+        // Find the status field - second comma-delimited token after $GPRMC
+        // Format: $GPRMC,<time>,<status>,<lat>,<N/S>,<lon>,<E/W>,...
+        char *p = Ql_strstr((char *)gps_buf, "$GPRMC");
+        if (p != NULL)
+        {
+            char time_buf[16] = {0};
+            char status_buf[4] = {0};
+            char lat_buf[16]  = {0};
+            char ns_buf[4]    = {0};
+            char lon_buf[16]  = {0};
+            char ew_buf[4]    = {0};
+ 
+            // Parse the fixed NMEA RMC fields
+            s32 parsed = Ql_sscanf(p, "$GPRMC,%[^,],%[^,],%[^,],%[^,],%[^,],%[^,]",
+                                   time_buf, status_buf,
+                                   lat_buf, ns_buf,
+                                   lon_buf, ew_buf);
+ 
+            if (parsed >= 6 && status_buf[0] == 'A')
+            {
+                // Convert NMEA ddmm.mmmm format to decimal degrees
+                // Latitude:  ddmm.mmmm  → dd + mm.mmmm/60
+                // Longitude: dddmm.mmmm → ddd + mm.mmmm/60
+                float raw_lat = Ql_atof(lat_buf);
+                float raw_lon = Ql_atof(lon_buf);
+ 
+                int lat_deg = (int)(raw_lat / 100);
+                int lon_deg = (int)(raw_lon / 100);
+ 
+                latitude  = lat_deg + (raw_lat - lat_deg * 100) / 60.0f;
+                longitude = lon_deg + (raw_lon - lon_deg * 100) / 60.0f;
+ 
+                // Apply hemisphere sign
+                if (ns_buf[0] == 'S') latitude  = -latitude;
+                if (ew_buf[0] == 'W') longitude = -longitude;
+ 
+                has_fix = TRUE;
+                src     = "gps";
+                Ql_Debug_Trace("[LOC] GPS fix: %.6f, %.6f\r\n", latitude, longitude);
+            }
+            else
+            {
+                Ql_Debug_Trace("[LOC] GPS status V (no fix yet)\r\n");
+            }
+        }
+    }
+    else
+    {
+        Ql_Debug_Trace("[LOC] GPS read failed (ret=%d)\r\n", ret);
+    }
+ 
+    /*----------------------------------------------------------------------
+     * Step 2 — Cell tower fallback
+     * RIL_GetLocation_Ex is synchronous and uses the QuecLocator service
+     * to map the visible cell towers to a lat/lon via Quectel's cloud.
+     * Accuracy is ~300m–2km depending on cell density, but it works
+     * anywhere with GSM signal — indoors, underground, anywhere.
+     *--------------------------------------------------------------------*/
+    if (!has_fix)
+    {
+        ST_LocInfo cell_loc;
+        Ql_memset(&cell_loc, 0, sizeof(ST_LocInfo));
+ 
+        Ql_Debug_Trace("[LOC] no GPS fix, trying cell tower positioning\r\n");
+        ret = RIL_GetLocation_Ex(&cell_loc);
+        if (ret == RIL_AT_SUCCESS &&
+            (cell_loc.latitude != 0.0f || cell_loc.longitude != 0.0f))
+        {
+            latitude  = cell_loc.latitude;
+            longitude = cell_loc.longitude;
+            has_fix   = TRUE;
+            src       = "cell";
+            Ql_Debug_Trace("[LOC] cell fix: %.6f, %.6f\r\n", latitude, longitude);
+        }
+        else
+        {
+            Ql_Debug_Trace("[LOC] cell tower positioning failed (ret=%d)\r\n", ret);
+        }
+    }
+ 
+    /*----------------------------------------------------------------------
+     * Step 3 — Publish if we have a location, escalate if we don't
+     *--------------------------------------------------------------------*/
+    if (!has_fix)
+    {
+        // Both sources failed - count it but don't publish garbage
+        m_pub_fail_count++;
+        Ql_Debug_Trace("[LOC] no location from any source, fail count=%d\r\n",
+                       m_pub_fail_count);
+ 
+        if (m_pub_fail_count >= MAX_PUBLISH_FAILURES)
+        {
+            // Persistent location failure - something is deeply wrong,
+            // tear down MQTT and reconnect from scratch
+            Ql_Debug_Trace("[LOC] too many location failures, reconnecting MQTT\r\n");
+            m_pub_fail_count = 0;
+            teardown_mqtt();
+            enter_backoff(5, STATE_MQTT_OPENING);
+        }
+        return;
+    }
+ 
+    // Build JSON payload
+    m_msg_id++;
+    if (m_msg_id > 65535) m_msg_id = 1;
+ 
+    Ql_sprintf(payload,
+               "{\"clientId\":\"%s\",\"lat\":%.6f,\"lng\":%.6f,\"src\":\"%s\"}",
+               MQTT_CLIENT_ID, latitude, longitude, src);
+ 
+    Ql_Debug_Trace("[PUB] topic=%s payload=%s\r\n", MQTT_PUB_TOPIC, payload);
+ 
+    ret = RIL_MQTT_QMTPUB(m_conn_id,
+                           m_msg_id,
+                           QOS1_AT_LEASET_ONCE,
+                           0,                        // retain = false
+                           (u8 *)MQTT_PUB_TOPIC,
+                           Ql_strlen(payload),
+                           (u8 *)payload);
+ 
+    if (ret == RIL_AT_SUCCESS)
+    {
+        // Successful publish - reset all failure counters
+        m_pub_fail_count  = 0;
+        m_mqtt_fail_count = 0;
+        Ql_Debug_Trace("[PUB] published successfully (msgId=%d)\r\n", m_msg_id);
+    }
+    else
+    {
+        m_pub_fail_count++;
+        Ql_Debug_Trace("[PUB] publish failed (ret=%d), fail count=%d\r\n",
+                       ret, m_pub_fail_count);
+ 
+        if (m_pub_fail_count >= MAX_PUBLISH_FAILURES)
+        {
+            // Broker is not responding - tear down MQTT and reconnect
+            Ql_Debug_Trace("[PUB] too many publish failures, reconnecting MQTT\r\n");
+            m_pub_fail_count = 0;
+            teardown_mqtt();
+            enter_backoff(5, STATE_MQTT_OPENING);
+        }
+    }
+}
+ 
+/*===========================================================================
+ * EOF - proc_main_task() in next part
+ *=========================================================================*/
+ 
 #endif /* __PETFINDER__ */
