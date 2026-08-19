@@ -26,7 +26,6 @@
 #include "ql_trace.h"
 #include "ql_error.h"
 #include "ql_timer.h"
-#include "ql_time.h"
 #include "ql_system.h"
 #include "ql_uart.h"
 #include "ql_fs.h"
@@ -197,8 +196,9 @@ static void teardown_pdp(void);
 static void enter_backoff(u16 ticks, AppState next_state);
 static bool sms_init(void);
 static void rebuild_topic(void);
-static void get_local_timestamp(char *ts_out, u32 ts_size,
-                                 char *tz_out, u32 tz_size);
+static void update_gps_timestamp(const char *time_field, const char *date_field);
+static void get_gps_timestamp(char *ts_out, u32 ts_size,
+                               char *tz_out, u32 tz_size);
 
 /*===========================================================================
  * [9] Config load / save  (UFS file)
@@ -566,46 +566,121 @@ static void rebuild_topic(void)
 }
 
 /*---------------------------------------------------------------------------
- * get_local_timestamp()
- * Reads network time via Ql_GetLocalTime() (ql_time.h). This time (and its
- * timezone offset) comes from the operator's network / SIM, NOT from any
- * local device setting - so it tracks whatever the operator reports
- * (Irancell normally reports +03:30 for Iran).
+ * GPS-derived timestamp
  *
- * ts_out -> "YYYY-MM-DD HH:MM:SS"
- * tz_out -> "+HH:MM" / "-HH:MM"  (ST_Time.timezone is in quarter-hour
- *           units, per ql_time.h's own comment: 22 means "+5:30")
+ * We deliberately do NOT use network/NITZ time (Ql_GetLocalTime) - Irancell
+ * (and Iranian operators generally) frequently don't broadcast NITZ, which
+ * left the module's RTC stuck at its unset default (looked like 2004-01-01).
+ *
+ * Instead we take UTC date+time straight from the GPS RMC sentence (fields
+ * 1 and 9 - the same sentence we already parse for lat/lon), which is
+ * always UTC and doesn't depend on the operator at all. GPS itself carries
+ * no timezone, so a fixed offset is added here in firmware.
+ *
+ * The most recent GPS-derived timestamp is kept in RAM only (m_last_ts) -
+ * no UFS persistence, so it resets on reboot per your earlier call. If we
+ * haven't had a single GPS fix yet since boot, we report a placeholder
+ * ("0000-00-00 00:00:00") rather than inventing a plausible-looking time.
  *-------------------------------------------------------------------------*/
-static void get_local_timestamp(char *ts_out, u32 ts_size,
-                                 char *tz_out, u32 tz_size)
-{
-    ST_Time t;
-    ST_Time *ret;
-    s32 tz_quarters, tz_abs, tz_h, tz_m;
-    char sign;
+#define GPS_TZ_OFFSET_MIN   (3 * 60 + 30)   /* +03:30 - Iran. GPS is UTC-only,
+                                              * so this is a firmware constant,
+                                              * not read from anywhere. Change
+                                              * this (and GPS_TZ_STRING below)
+                                              * if the device ever operates in
+                                              * a different timezone. */
+#define GPS_TZ_STRING        "+03:30"
 
-    Ql_memset(&t, 0, sizeof(t));
-    ret = Ql_GetLocalTime(&t);
-    if (ret == NULL)
-    {
-        APP_DEBUG("[TIME] Ql_GetLocalTime failed\r\n");
-        Ql_strcpy(ts_out, "1970-01-01 00:00:00");
-        Ql_strcpy(tz_out, "+00:00");
+static bool m_time_valid = FALSE;
+static char m_last_ts[20] = "0000-00-00 00:00:00";
+
+static bool is_leap_year(s32 y)
+{
+    return ((y % 4 == 0) && (y % 100 != 0 || y % 400 == 0));
+}
+
+static u8 days_in_month(s32 y, s32 mon)
+{
+    static const u8 dim[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    if (mon == 2 && is_leap_year(y)) return 29;
+    return dim[mon - 1];
+}
+
+/*---------------------------------------------------------------------------
+ * update_gps_timestamp()
+ * time_field: NMEA RMC field 1, "hhmmss.sss" (UTC)
+ * date_field: NMEA RMC field 9, "ddmmyy"      (UTC)
+ * Parses both, applies the fixed GPS_TZ_OFFSET_MIN, and stores the
+ * resulting local date/time string into m_last_ts. Only call this once
+ * status=='A' (valid fix) - garbage in these fields otherwise.
+ *-------------------------------------------------------------------------*/
+static void update_gps_timestamp(const char *time_field, const char *date_field)
+{
+    s32 hh, mm, ss, dd, mon, yyyy;
+    s32 total_min, day_add;
+
+    if (Ql_strlen((char *)time_field) < 6 || Ql_strlen((char *)date_field) < 6)
         return;
+
+    hh = (time_field[0]-'0')*10 + (time_field[1]-'0');
+    mm = (time_field[2]-'0')*10 + (time_field[3]-'0');
+    ss = (time_field[4]-'0')*10 + (time_field[5]-'0');
+
+    dd  = (date_field[0]-'0')*10 + (date_field[1]-'0');
+    mon = (date_field[2]-'0')*10 + (date_field[3]-'0');
+    yyyy = 2000 + (date_field[4]-'0')*10 + (date_field[5]-'0');
+
+    if (hh > 23 || mm > 59 || ss > 59 || dd < 1 || dd > 31 || mon < 1 || mon > 12)
+        return;   /* malformed field - leave m_last_ts untouched */
+
+    total_min = hh * 60 + mm + GPS_TZ_OFFSET_MIN;
+    day_add = 0;
+    while (total_min >= 24 * 60) { total_min -= 24 * 60; day_add++; }
+    while (total_min < 0)        { total_min += 24 * 60; day_add--; }
+    hh = total_min / 60;
+    mm = total_min % 60;
+
+    while (day_add > 0)
+    {
+        dd++;
+        if (dd > days_in_month(yyyy, mon))
+        {
+            dd = 1;
+            mon++;
+            if (mon > 12) { mon = 1; yyyy++; }
+        }
+        day_add--;
+    }
+    while (day_add < 0)
+    {
+        dd--;
+        if (dd < 1)
+        {
+            mon--;
+            if (mon < 1) { mon = 12; yyyy--; }
+            dd = days_in_month(yyyy, mon);
+        }
+        day_add++;
     }
 
-    Ql_sprintf(ts_out, "%04d-%02d-%02d %02d:%02d:%02d",
-               t.year, t.month, t.day,
-               t.hour, t.minute, t.second);
+    Ql_sprintf(m_last_ts, "%04d-%02d-%02d %02d:%02d:%02d",
+               (s32)yyyy, (s32)mon, (s32)dd, (s32)hh, (s32)mm, (s32)ss);
+    m_time_valid = TRUE;
+}
 
-    tz_quarters = t.timezone;
-    sign   = (tz_quarters < 0) ? '-' : '+';
-    tz_abs = (tz_quarters < 0) ? -tz_quarters : tz_quarters;
-    tz_h   = (tz_abs * 15) / 60;
-    tz_m   = (tz_abs * 15) % 60;
-
-    Ql_sprintf(tz_out, "%c%02d:%02d", sign, tz_h, tz_m);
-
+/*---------------------------------------------------------------------------
+ * get_gps_timestamp()
+ * Returns the most recent GPS-derived local timestamp (RAM only - see
+ * update_gps_timestamp above). Placeholder date if we've never had a fix.
+ * Timezone is always the fixed GPS_TZ_STRING since it's a firmware
+ * constant, not something read from a live source.
+ *-------------------------------------------------------------------------*/
+static void get_gps_timestamp(char *ts_out, u32 ts_size,
+                               char *tz_out, u32 tz_size)
+{
+    if (!m_time_valid)
+        APP_DEBUG("[TIME] no GPS fix since boot yet, ts is placeholder\r\n");
+    Ql_strcpy(ts_out, m_last_ts);
+    Ql_strcpy(tz_out, GPS_TZ_STRING);
     (void)ts_size;
     (void)tz_size;
 }
@@ -977,14 +1052,16 @@ static void acquire_and_send_location(void)
         char *p = Ql_strstr((char *)m_gps_buf, "RMC");
         if (p != NULL)
         {
-            char status[4], lat_f[16], ns[4], lon_f[16], ew[4];
+            char status[4], time_f[16], lat_f[16], ns[4], lon_f[16], ew[4], date_f[8];
             while (p > (char *)m_gps_buf && *p != '$') p--;
 
+            nmea_get_field(p, 1, time_f, sizeof(time_f));
             nmea_get_field(p, 2, status, sizeof(status));
             nmea_get_field(p, 3, lat_f,  sizeof(lat_f));
             nmea_get_field(p, 4, ns,     sizeof(ns));
             nmea_get_field(p, 5, lon_f,  sizeof(lon_f));
             nmea_get_field(p, 6, ew,     sizeof(ew));
+            nmea_get_field(p, 9, date_f, sizeof(date_f));
 
             if (status[0] == 'A')
             {
@@ -994,6 +1071,7 @@ static void acquire_and_send_location(void)
                     if (ns[0] == 'S') gps_lat_udeg = -gps_lat_udeg;
                     if (ew[0] == 'W') gps_lng_udeg = -gps_lng_udeg;
                     gps_has_fix = TRUE;
+                    update_gps_timestamp(time_f, date_f);
                     APP_DEBUG("[LOC] GPS fix\r\n");
                 }
             }
@@ -1046,7 +1124,7 @@ static void acquire_and_send_location(void)
     udeg_to_str(cell_lat_udeg, cell_lat_str);
     udeg_to_str(cell_lng_udeg, cell_lng_str);
 
-    get_local_timestamp(ts_str, sizeof(ts_str), tz_str, sizeof(tz_str));
+    get_gps_timestamp(ts_str, sizeof(ts_str), tz_str, sizeof(tz_str));
 
     m_msg_id++;
     if (m_msg_id > 65535) m_msg_id = 1;
@@ -1306,3 +1384,4 @@ void proc_main_task(s32 taskId)
  * END OF FILE
  *=========================================================================*/
 #endif /* __PETFINDER__ */
+
