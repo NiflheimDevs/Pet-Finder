@@ -56,11 +56,17 @@
 #define APN_PASS          ""
 
 /* -- MQTT broker defaults ----------------------------------------------- */
-#define DEFAULT_MQTT_HOST  "45.67.139.65"
-#define DEFAULT_MQTT_PORT  1883
-#define DEFAULT_MQTT_USER  "petfinder-01"
-#define DEFAULT_MQTT_PASS  "123qweasd"
-#define DEFAULT_CLIENT_ID  "petfinder-01"
+// #define DEFAULT_MQTT_HOST  "45.67.139.65"
+// #define DEFAULT_MQTT_PORT  1883
+// #define DEFAULT_MQTT_USER  "petfinder-01"
+// #define DEFAULT_MQTT_PASS  "123qweasd"
+// #define DEFAULT_CLIENT_ID  "petfinder-01"
+#define DEFAULT_MQTT_HOST "mqtt.metable.ir"
+#define DEFAULT_MQTT_PORT 32090
+#define DEFAULT_MQTT_USER "gholamiali41379@gmail.com"
+#define DEFAULT_MQTT_PASS "Mahdi1412@"
+#define DEFAULT_CLIENT_ID "petfinder-01"
+
 
 /* Topic is now built at runtime as "<user>/loc" - see rebuild_topic() */
 
@@ -1032,6 +1038,7 @@ static void acquire_and_send_location(void)
     s32  gps_lat_udeg = 0, gps_lng_udeg = 0;
     bool gps_has_fix  = FALSE;
     char gps_lat_str[16], gps_lng_str[16];
+    char gps_speed[16], gps_course[16];
 
     /* Cell */
     s32  cell_lat_udeg = 0, cell_lng_udeg = 0;
@@ -1043,6 +1050,9 @@ static void acquire_and_send_location(void)
 
     s32  ret;
 
+    Ql_strcpy(gps_speed,  "0.0");
+    Ql_strcpy(gps_course, "0.0");
+
     /* ---- GPS: read regardless of whether we'll end up using it ---- */
     Ql_memset(m_gps_buf, 0, sizeof(m_gps_buf));
     ret = RIL_GPS_Read((u8 *)GPS_READ_ITEM, m_gps_buf);
@@ -1053,15 +1063,18 @@ static void acquire_and_send_location(void)
         if (p != NULL)
         {
             char status[4], time_f[16], lat_f[16], ns[4], lon_f[16], ew[4], date_f[8];
+            char speed_f[12], course_f[12];
             while (p > (char *)m_gps_buf && *p != '$') p--;
 
-            nmea_get_field(p, 1, time_f, sizeof(time_f));
-            nmea_get_field(p, 2, status, sizeof(status));
-            nmea_get_field(p, 3, lat_f,  sizeof(lat_f));
-            nmea_get_field(p, 4, ns,     sizeof(ns));
-            nmea_get_field(p, 5, lon_f,  sizeof(lon_f));
-            nmea_get_field(p, 6, ew,     sizeof(ew));
-            nmea_get_field(p, 9, date_f, sizeof(date_f));
+            nmea_get_field(p, 1, time_f,   sizeof(time_f));
+            nmea_get_field(p, 2, status,   sizeof(status));
+            nmea_get_field(p, 3, lat_f,    sizeof(lat_f));
+            nmea_get_field(p, 4, ns,       sizeof(ns));
+            nmea_get_field(p, 5, lon_f,    sizeof(lon_f));
+            nmea_get_field(p, 6, ew,       sizeof(ew));
+            nmea_get_field(p, 7, speed_f,  sizeof(speed_f));
+            nmea_get_field(p, 8, course_f, sizeof(course_f));
+            nmea_get_field(p, 9, date_f,   sizeof(date_f));
 
             if (status[0] == 'A')
             {
@@ -1071,6 +1084,8 @@ static void acquire_and_send_location(void)
                     if (ns[0] == 'S') gps_lat_udeg = -gps_lat_udeg;
                     if (ew[0] == 'W') gps_lng_udeg = -gps_lng_udeg;
                     gps_has_fix = TRUE;
+                    Ql_strcpy(gps_speed,  speed_f[0]  ? speed_f  : "0.0");
+                    Ql_strcpy(gps_course, course_f[0] ? course_f : "0.0");
                     update_gps_timestamp(time_f, date_f);
                     APP_DEBUG("[LOC] GPS fix\r\n");
                 }
@@ -1132,11 +1147,14 @@ static void acquire_and_send_location(void)
     Ql_memset(m_payload, 0, sizeof(m_payload));
     Ql_sprintf(m_payload,
                "{\"clientId\":\"%s\","
-               "\"gps\":{\"lat\":%s,\"lng\":%s,\"fix\":%s},"
-               "\"cell\":{\"lat\":%s,\"lng\":%s,\"fix\":%s},"
+               "\"gps_lat\":%s,\"gps_lng\":%s,\"gps_fix\":%s,"
+               "\"gps_speed\":%s,\"gps_course\":%s,"
+               "\"gps_sent\":\"RMC\","
+               "\"cell_lat\":%s,\"cell_lng\":%s,\"cell_fix\":%s,"
                "\"ts\":\"%s\",\"tz\":\"%s\"}",
                (char *)m_cfg.client_id,
-               gps_lat_str,  gps_lng_str,  gps_has_fix  ? "true" : "false",
+               gps_lat_str, gps_lng_str, gps_has_fix ? "true" : "false",
+               gps_speed, gps_course,
                cell_lat_str, cell_lng_str, cell_has_fix ? "true" : "false",
                ts_str, tz_str);
 
@@ -1384,4 +1402,3 @@ void proc_main_task(s32 taskId)
  * END OF FILE
  *=========================================================================*/
 #endif /* __PETFINDER__ */
-
