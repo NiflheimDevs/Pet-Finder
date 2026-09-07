@@ -38,7 +38,7 @@
 #include "ril_location.h"
 #include "ril_mqtt.h"
 #include "ril_sms.h"
-#include "ril_system.h"   /* needed for URC_SYS_INIT_STATE_IND / SYS_STATE_SMSOK */
+#include "ril_system.h" /* needed for URC_SYS_INIT_STATE_IND / SYS_STATE_SMSOK */
 
 #include "ql_gprs.h"
 
@@ -51,9 +51,9 @@
  *=========================================================================*/
 
 /* -- Cellular ----------------------------------------------------------- */
-#define APN               "mtnirancell"
-#define APN_USER          ""
-#define APN_PASS          ""
+#define APN "mtnirancell"
+#define APN_USER ""
+#define APN_PASS ""
 
 /* -- MQTT broker defaults ----------------------------------------------- */
 // #define DEFAULT_MQTT_HOST  "45.67.139.65"
@@ -65,8 +65,7 @@
 #define DEFAULT_MQTT_PORT 32090
 #define DEFAULT_MQTT_USER "gholamiali41379@gmail.com"
 #define DEFAULT_MQTT_PASS "Mahdi1412@"
-#define DEFAULT_CLIENT_ID "petfinder-01"
-
+#define DEFAULT_CLIENT_ID "petfinder-GGA-RMC"
 
 /* Topic is now built at runtime as "<user>/loc" - see rebuild_topic() */
 
@@ -77,52 +76,55 @@
  * "UFS:pf_cfg.txt", which fails every time (fd < 0), so the saved config
  * was never actually persisted (or reloaded) across reboots.
  * ------------------------------------------------------------------------ */
-#define CFG_FILE_PATH     "pf_cfg.txt"
+#define CFG_FILE_PATH "pf_cfg.txt"
 
 /* -- Field size limits -------------------------------------------------- */
-#define CFG_HOST_LEN   64
-#define CFG_USER_LEN   64
-#define CFG_PASS_LEN   64
-#define CFG_ID_LEN     32
+#define CFG_HOST_LEN 64
+#define CFG_USER_LEN 64
+#define CFG_PASS_LEN 64
+#define CFG_ID_LEN 32
 
 /* -- Timing ------------------------------------------------------------- */
-#define PUBLISH_INTERVAL_MS       (5UL * 1000UL)
+#define PUBLISH_INTERVAL_MS (5UL * 1000UL)
 #define STATE_MACHINE_INTERVAL_MS (1UL * 1000UL)
-#define RESET_AFTER_TICKS         (24UL * 60UL * 60UL)
+#define RESET_AFTER_TICKS (24UL * 60UL * 60UL)
 
 /* -- Fault thresholds --------------------------------------------------- */
-#define MAX_PUBLISH_FAILURES   5
-#define MAX_MQTT_FAILURES      3
-#define MAX_PDP_FAILURES       3
+#define MAX_PUBLISH_FAILURES 5
+#define MAX_MQTT_FAILURES 3
+#define MAX_PDP_FAILURES 3
 
 /*===========================================================================
  * [3] Debug output
  *=========================================================================*/
 #define DEBUG_ENABLE 1
 #if DEBUG_ENABLE > 0
-  #define DEBUG_PORT   UART_PORT1
-  #define DBG_BUF_LEN  512
-  static char DBG_BUFFER[DBG_BUF_LEN];
-  #define APP_DEBUG(FORMAT,...) {\
-      Ql_memset(DBG_BUFFER, 0, DBG_BUF_LEN);\
-      Ql_sprintf(DBG_BUFFER, FORMAT, ##__VA_ARGS__); \
-      if (UART_PORT2 == (DEBUG_PORT)) \
-      {\
-          Ql_Debug_Trace(DBG_BUFFER);\
-      } else {\
-          Ql_UART_Write((Enum_SerialPort)(DEBUG_PORT), (u8*)(DBG_BUFFER), \
-                        Ql_strlen((const char *)(DBG_BUFFER)));\
-      }\
-  }
+#define DEBUG_PORT UART_PORT1
+#define DBG_BUF_LEN 512
+static char DBG_BUFFER[DBG_BUF_LEN];
+#define APP_DEBUG(FORMAT, ...)                                               \
+    {                                                                        \
+        Ql_memset(DBG_BUFFER, 0, DBG_BUF_LEN);                               \
+        Ql_sprintf(DBG_BUFFER, FORMAT, ##__VA_ARGS__);                       \
+        if (UART_PORT2 == (DEBUG_PORT))                                      \
+        {                                                                    \
+            Ql_Debug_Trace(DBG_BUFFER);                                      \
+        }                                                                    \
+        else                                                                 \
+        {                                                                    \
+            Ql_UART_Write((Enum_SerialPort)(DEBUG_PORT), (u8 *)(DBG_BUFFER), \
+                          Ql_strlen((const char *)(DBG_BUFFER)));            \
+        }                                                                    \
+    }
 #else
-  #define APP_DEBUG(FORMAT,...)
+#define APP_DEBUG(FORMAT, ...)
 #endif
 
 /*===========================================================================
  * [4] Timer IDs  (must be > 0xFF)
  *=========================================================================*/
-#define TIMER_ID_STATE_MACHINE   (TIMER_ID_USER_START + 1)   /* 0x101 */
-#define TIMER_ID_PUBLISH         (TIMER_ID_USER_START + 2)   /* 0x102 */
+#define TIMER_ID_STATE_MACHINE (TIMER_ID_USER_START + 1) /* 0x101 */
+#define TIMER_ID_PUBLISH (TIMER_ID_USER_START + 2)       /* 0x102 */
 
 /*===========================================================================
  * [5] State machine
@@ -164,32 +166,33 @@ static BrokerConfig m_cfg;
 /*===========================================================================
  * [7] Module-level variables
  *=========================================================================*/
-static AppState       m_state           = STATE_BOOT;
-static Enum_ConnectID m_conn_id         = ConnectID_0;
-static u32            m_msg_id          = 0;
+static AppState m_state = STATE_BOOT;
+static Enum_ConnectID m_conn_id = ConnectID_0;
+static u32 m_msg_id = 0;
 
-static u8   m_pub_fail_count  = 0;
-static u8   m_mqtt_fail_count = 0;
-static u8   m_pdp_fail_count  = 0;
+static u8 m_pub_fail_count = 0;
+static u8 m_mqtt_fail_count = 0;
+static u8 m_pdp_fail_count = 0;
 
-static AppState m_backoff_next  = STATE_MQTT_OPENING;
-static u16      m_backoff_ticks = 0;
+static AppState m_backoff_next = STATE_MQTT_OPENING;
+static u16 m_backoff_ticks = 0;
 
-static bool m_gps_opened    = FALSE;
-static u32  m_uptime_ticks  = 0;
-static bool m_busy          = FALSE;
-static bool m_sms_ready     = FALSE;
+static bool m_gps_opened = FALSE;
+static u32 m_uptime_ticks = 0;
+static bool m_busy = FALSE;
+static bool m_sms_ready = FALSE;
 
-static u8   m_gps_buf[512];
-static char m_payload[300];   /* was 192 - now holds gps+cell+ts+tz */
-static char m_topic[CFG_USER_LEN + 8];   /* "<user>/loc" */
+static u8 m_gps_buf[512];              /* holds RMC sentence */
+static u8 m_gps_buf2[512];             /* holds GGA sentence (sat count / fix quality) */
+static char m_payload[340];            /* was 300 - now also holds gps_sat/gps_quality */
+static char m_topic[CFG_USER_LEN + 8]; /* "<user>/loc" */
 
-static u8 m_open_wait_ticks  = 0;
-static u8 m_conn_wait_ticks  = 0;
+static u8 m_open_wait_ticks = 0;
+static u8 m_conn_wait_ticks = 0;
 static u8 m_close_wait_ticks = 0;
 
-#define MQTT_OPEN_TIMEOUT_TICKS  30
-#define MQTT_CONN_TIMEOUT_TICKS  30
+#define MQTT_OPEN_TIMEOUT_TICKS 30
+#define MQTT_CONN_TIMEOUT_TICKS 30
 #define MQTT_CLOSE_TIMEOUT_TICKS 15
 
 /*===========================================================================
@@ -204,7 +207,7 @@ static bool sms_init(void);
 static void rebuild_topic(void);
 static void update_gps_timestamp(const char *time_field, const char *date_field);
 static void get_gps_timestamp(char *ts_out, u32 ts_size,
-                               char *tz_out, u32 tz_size);
+                              char *tz_out, u32 tz_size);
 
 /*===========================================================================
  * [9] Config load / save  (UFS file)
@@ -223,24 +226,28 @@ static void get_gps_timestamp(char *ts_out, u32 ts_size,
  * Returns TRUE on success.
  *-------------------------------------------------------------------------*/
 static bool cfg_parse_field(const char *buf, const char *key,
-                             char *out, u32 out_size)
+                            char *out, u32 out_size)
 {
     const char *p;
     const char *end;
     u32 n;
 
     p = Ql_strstr((char *)buf, (char *)key);
-    if (p == NULL) return FALSE;
+    if (p == NULL)
+        return FALSE;
 
     p += Ql_strlen((char *)key);
-    if (*p != '=') return FALSE;
+    if (*p != '=')
+        return FALSE;
     p++;
 
     end = p;
-    while (*end != '\0' && *end != '\n' && *end != '\r') end++;
+    while (*end != '\0' && *end != '\n' && *end != '\r')
+        end++;
 
     n = (u32)(end - p);
-    if (n == 0 || n >= out_size) return FALSE;
+    if (n == 0 || n >= out_size)
+        return FALSE;
 
     Ql_memcpy(out, p, n);
     out[n] = '\0';
@@ -253,17 +260,17 @@ static bool cfg_parse_field(const char *buf, const char *key,
  *-------------------------------------------------------------------------*/
 static void cfg_load(void)
 {
-    s32  fd;
-    u8   buf[256];
-    u32  rd = 0;
+    s32 fd;
+    u8 buf[256];
+    u32 rd = 0;
     char tmp[CFG_HOST_LEN];
 
     /* Apply defaults first so we always have valid values */
     Ql_memset(&m_cfg, 0, sizeof(m_cfg));
-    Ql_strcpy((char *)m_cfg.host,      DEFAULT_MQTT_HOST);
+    Ql_strcpy((char *)m_cfg.host, DEFAULT_MQTT_HOST);
     m_cfg.port = DEFAULT_MQTT_PORT;
-    Ql_strcpy((char *)m_cfg.user,      DEFAULT_MQTT_USER);
-    Ql_strcpy((char *)m_cfg.pass,      DEFAULT_MQTT_PASS);
+    Ql_strcpy((char *)m_cfg.user, DEFAULT_MQTT_USER);
+    Ql_strcpy((char *)m_cfg.pass, DEFAULT_MQTT_PASS);
     Ql_strcpy((char *)m_cfg.client_id, DEFAULT_CLIENT_ID);
 
     fd = Ql_FS_Open((u8 *)CFG_FILE_PATH, QL_FS_READ_ONLY);
@@ -309,10 +316,10 @@ static void cfg_load(void)
  *-------------------------------------------------------------------------*/
 static bool cfg_save(void)
 {
-    s32  fd;
+    s32 fd;
     char buf[256];
-    u32  written = 0;
-    u32  len;
+    u32 written = 0;
+    u32 len;
 
     Ql_memset(buf, 0, sizeof(buf));
     Ql_sprintf(buf, "host=%s\nport=%d\nuser=%s\npass=%s\nid=%s\n",
@@ -358,17 +365,19 @@ static bool cfg_save(void)
  * Finds "key=value" in a comma-delimited string and copies value into out.
  *-------------------------------------------------------------------------*/
 static bool sms_parse_value(const char *msg, const char *key,
-                             char *out, u32 out_size)
+                            char *out, u32 out_size)
 {
     const char *p;
     const char *end;
     u32 n;
 
     p = Ql_strstr((char *)msg, (char *)key);
-    if (p == NULL) return FALSE;
+    if (p == NULL)
+        return FALSE;
 
     p += Ql_strlen((char *)key);
-    if (*p != '=') return FALSE;
+    if (*p != '=')
+        return FALSE;
     p++;
 
     /* Value ends at comma, CR, LF, or end of string */
@@ -377,7 +386,8 @@ static bool sms_parse_value(const char *msg, const char *key,
         end++;
 
     n = (u32)(end - p);
-    if (n == 0 || n >= out_size) return FALSE;
+    if (n == 0 || n >= out_size)
+        return FALSE;
 
     Ql_memcpy(out, p, n);
     out[n] = '\0';
@@ -413,7 +423,7 @@ static bool sms_init(void)
      * the host immediately via +CMTI -> URC_NEW_SMS_IND, instead of just
      * buffering it silently. */
     ret = Ql_RIL_SendATCmd("AT+CNMI=2,1,0,0,0",
-                            Ql_strlen("AT+CNMI=2,1,0,0,0"), NULL, NULL, 0);
+                           Ql_strlen("AT+CNMI=2,1,0,0,0"), NULL, NULL, 0);
     if (ret != RIL_AT_SUCCESS)
     {
         APP_DEBUG("[SMS] AT+CNMI set failed, ret=%d\r\n", ret);
@@ -446,7 +456,7 @@ static bool handle_config_sms(u32 sms_index)
     char new_port_str[8];
     char new_user[CFG_USER_LEN];
     char new_pass[CFG_PASS_LEN];
-    s32  ret;
+    s32 ret;
 
     APP_DEBUG("[SMS] message received, index=%d\r\n", sms_index);
 
@@ -467,7 +477,7 @@ static bool handle_config_sms(u32 sms_index)
     }
 
     deliver = &info->param.deliverParam;
-    body    = (const char *)deliver->data;
+    body = (const char *)deliver->data;
 
     APP_DEBUG("[SMS] from=%s body=%s\r\n", deliver->oa, body);
 
@@ -493,7 +503,7 @@ static bool handle_config_sms(u32 sms_index)
      * it with an id= field - e.g. user=ali -> client_id becomes "ali",
      * but user=ali,id=ali-collar-2 keeps the explicit id. */
     if (!sms_parse_value(body, "id", (char *)m_cfg.client_id,
-                          sizeof(m_cfg.client_id)))
+                         sizeof(m_cfg.client_id)))
     {
         Ql_strcpy((char *)m_cfg.client_id, new_user);
     }
@@ -529,8 +539,8 @@ static void enter_backoff(u16 ticks, AppState next_state)
     APP_DEBUG("[BACKOFF] waiting %d ticks, then state %d\r\n",
               ticks, (s32)next_state);
     m_backoff_ticks = ticks;
-    m_backoff_next  = next_state;
-    m_state         = STATE_BACKOFF;
+    m_backoff_next = next_state;
+    m_state = STATE_BACKOFF;
 }
 
 static void teardown_mqtt(void)
@@ -588,13 +598,13 @@ static void rebuild_topic(void)
  * haven't had a single GPS fix yet since boot, we report a placeholder
  * ("0000-00-00 00:00:00") rather than inventing a plausible-looking time.
  *-------------------------------------------------------------------------*/
-#define GPS_TZ_OFFSET_MIN   (3 * 60 + 30)   /* +03:30 - Iran. GPS is UTC-only,
-                                              * so this is a firmware constant,
-                                              * not read from anywhere. Change
-                                              * this (and GPS_TZ_STRING below)
-                                              * if the device ever operates in
-                                              * a different timezone. */
-#define GPS_TZ_STRING        "+03:30"
+#define GPS_TZ_OFFSET_MIN (3 * 60 + 30) /* +03:30 - Iran. GPS is UTC-only, \
+                                         * so this is a firmware constant, \
+                                         * not read from anywhere. Change  \
+                                         * this (and GPS_TZ_STRING below)  \
+                                         * if the device ever operates in  \
+                                         * a different timezone. */
+#define GPS_TZ_STRING "+03:30"
 
 static bool m_time_valid = FALSE;
 static char m_last_ts[20] = "0000-00-00 00:00:00";
@@ -606,8 +616,9 @@ static bool is_leap_year(s32 y)
 
 static u8 days_in_month(s32 y, s32 mon)
 {
-    static const u8 dim[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
-    if (mon == 2 && is_leap_year(y)) return 29;
+    static const u8 dim[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (mon == 2 && is_leap_year(y))
+        return 29;
     return dim[mon - 1];
 }
 
@@ -627,21 +638,29 @@ static void update_gps_timestamp(const char *time_field, const char *date_field)
     if (Ql_strlen((char *)time_field) < 6 || Ql_strlen((char *)date_field) < 6)
         return;
 
-    hh = (time_field[0]-'0')*10 + (time_field[1]-'0');
-    mm = (time_field[2]-'0')*10 + (time_field[3]-'0');
-    ss = (time_field[4]-'0')*10 + (time_field[5]-'0');
+    hh = (time_field[0] - '0') * 10 + (time_field[1] - '0');
+    mm = (time_field[2] - '0') * 10 + (time_field[3] - '0');
+    ss = (time_field[4] - '0') * 10 + (time_field[5] - '0');
 
-    dd  = (date_field[0]-'0')*10 + (date_field[1]-'0');
-    mon = (date_field[2]-'0')*10 + (date_field[3]-'0');
-    yyyy = 2000 + (date_field[4]-'0')*10 + (date_field[5]-'0');
+    dd = (date_field[0] - '0') * 10 + (date_field[1] - '0');
+    mon = (date_field[2] - '0') * 10 + (date_field[3] - '0');
+    yyyy = 2000 + (date_field[4] - '0') * 10 + (date_field[5] - '0');
 
     if (hh > 23 || mm > 59 || ss > 59 || dd < 1 || dd > 31 || mon < 1 || mon > 12)
-        return;   /* malformed field - leave m_last_ts untouched */
+        return; /* malformed field - leave m_last_ts untouched */
 
     total_min = hh * 60 + mm + GPS_TZ_OFFSET_MIN;
     day_add = 0;
-    while (total_min >= 24 * 60) { total_min -= 24 * 60; day_add++; }
-    while (total_min < 0)        { total_min += 24 * 60; day_add--; }
+    while (total_min >= 24 * 60)
+    {
+        total_min -= 24 * 60;
+        day_add++;
+    }
+    while (total_min < 0)
+    {
+        total_min += 24 * 60;
+        day_add--;
+    }
     hh = total_min / 60;
     mm = total_min % 60;
 
@@ -652,7 +671,11 @@ static void update_gps_timestamp(const char *time_field, const char *date_field)
         {
             dd = 1;
             mon++;
-            if (mon > 12) { mon = 1; yyyy++; }
+            if (mon > 12)
+            {
+                mon = 1;
+                yyyy++;
+            }
         }
         day_add--;
     }
@@ -662,7 +685,11 @@ static void update_gps_timestamp(const char *time_field, const char *date_field)
         if (dd < 1)
         {
             mon--;
-            if (mon < 1) { mon = 12; yyyy--; }
+            if (mon < 1)
+            {
+                mon = 12;
+                yyyy--;
+            }
             dd = days_in_month(yyyy, mon);
         }
         day_add++;
@@ -681,7 +708,7 @@ static void update_gps_timestamp(const char *time_field, const char *date_field)
  * constant, not something read from a live source.
  *-------------------------------------------------------------------------*/
 static void get_gps_timestamp(char *ts_out, u32 ts_size,
-                               char *tz_out, u32 tz_size)
+                              char *tz_out, u32 tz_size)
 {
     if (!m_time_valid)
         APP_DEBUG("[TIME] no GPS fix since boot yet, ts is placeholder\r\n");
@@ -696,10 +723,11 @@ static void get_gps_timestamp(char *ts_out, u32 ts_size,
  *=========================================================================*/
 static bool nmea_get_field(const char *s, u8 idx, char *out, u32 out_size)
 {
-    u8  field = 0;
-    u32 n     = 0;
+    u8 field = 0;
+    u32 n = 0;
 
-    if (s == NULL || out == NULL || out_size == 0) return FALSE;
+    if (s == NULL || out == NULL || out_size == 0)
+        return FALSE;
     Ql_memset(out, 0, out_size);
 
     while (*s != '\0' && *s != '\r' && *s != '\n' && *s != '*')
@@ -707,7 +735,8 @@ static bool nmea_get_field(const char *s, u8 idx, char *out, u32 out_size)
         if (*s == ',')
         {
             field++;
-            if (field > idx) break;
+            if (field > idx)
+                break;
             s++;
             continue;
         }
@@ -725,34 +754,49 @@ static bool nmea_to_udeg(const char *s, s32 *out_udeg)
     s32 deg = 0, min_int = 0, min_frac = 0, frac_div = 1;
     s32 minutes_scaled;
 
-    if (s == NULL || out_udeg == NULL) return FALSE;
+    if (s == NULL || out_udeg == NULL)
+        return FALSE;
     len = (s32)Ql_strlen((char *)s);
-    if (len < 4) return FALSE;
+    if (len < 4)
+        return FALSE;
 
     for (i = 0; i < len; i++)
-        if (s[i] == '.') { dot = i; break; }
-    if (dot < 3) return FALSE;
+        if (s[i] == '.')
+        {
+            dot = i;
+            break;
+        }
+    if (dot < 3)
+        return FALSE;
 
     deg_digits = dot - 2;
-    if (deg_digits < 1 || deg_digits > 3) return FALSE;
+    if (deg_digits < 1 || deg_digits > 3)
+        return FALSE;
 
     for (i = 0; i < deg_digits; i++)
     {
-        if (s[i] < '0' || s[i] > '9') return FALSE;
+        if (s[i] < '0' || s[i] > '9')
+            return FALSE;
         deg = deg * 10 + (s[i] - '0');
     }
     for (i = deg_digits; i < dot; i++)
     {
-        if (s[i] < '0' || s[i] > '9') return FALSE;
+        if (s[i] < '0' || s[i] > '9')
+            return FALSE;
         min_int = min_int * 10 + (s[i] - '0');
     }
     for (i = dot + 1; i < len && (i - dot) <= 4; i++)
     {
-        if (s[i] < '0' || s[i] > '9') break;
-        min_frac  = min_frac * 10 + (s[i] - '0');
+        if (s[i] < '0' || s[i] > '9')
+            break;
+        min_frac = min_frac * 10 + (s[i] - '0');
         frac_div *= 10;
     }
-    while (frac_div < 10000) { min_frac *= 10; frac_div *= 10; }
+    while (frac_div < 10000)
+    {
+        min_frac *= 10;
+        frac_div *= 10;
+    }
 
     minutes_scaled = min_int * 10000 + min_frac;
     *out_udeg = deg * 1000000 + (minutes_scaled * 100) / 60;
@@ -764,13 +808,18 @@ static void udeg_to_str(s32 udeg, char *out)
     s32 whole, frac, i, n = 0, divisor = 100000;
     char tmp[8];
 
-    if (udeg < 0) { out[n++] = '-'; udeg = -udeg; }
+    if (udeg < 0)
+    {
+        out[n++] = '-';
+        udeg = -udeg;
+    }
     whole = udeg / 1000000;
-    frac  = udeg % 1000000;
+    frac = udeg % 1000000;
 
     Ql_memset(tmp, 0, sizeof(tmp));
     Ql_sprintf(tmp, "%d", whole);
-    for (i = 0; tmp[i] != '\0'; i++) out[n++] = tmp[i];
+    for (i = 0; tmp[i] != '\0'; i++)
+        out[n++] = tmp[i];
     out[n++] = '.';
     for (i = 0; i < 6; i++)
     {
@@ -785,7 +834,8 @@ static void udeg_to_str(s32 udeg, char *out)
  *=========================================================================*/
 static void Timer_Callback(u32 timerId, void *param)
 {
-    if (m_busy) return;
+    if (m_busy)
+        return;
     m_busy = TRUE;
 
     switch (timerId)
@@ -810,7 +860,7 @@ static void Timer_Callback(u32 timerId, void *param)
 static void state_machine_tick(void)
 {
     s32 ret;
-    s32 gsm_state  = 0;
+    s32 gsm_state = 0;
     s32 gprs_state = 0;
 
     m_uptime_ticks++;
@@ -883,7 +933,8 @@ static void state_machine_tick(void)
         {
             APP_DEBUG("[SM] PDP activation failed (ret=%d)\r\n", ret);
             m_pdp_fail_count++;
-            if (m_pdp_fail_count >= MAX_PDP_FAILURES) Ql_Reset(0);
+            if (m_pdp_fail_count >= MAX_PDP_FAILURES)
+                Ql_Reset(0);
             enter_backoff(15, STATE_WAIT_GPRS);
         }
         break;
@@ -924,7 +975,8 @@ static void state_machine_tick(void)
                 m_mqtt_fail_count = 0;
                 teardown_pdp();
             }
-            else enter_backoff(5, STATE_MQTT_OPENING);
+            else
+                enter_backoff(5, STATE_MQTT_OPENING);
         }
         break;
 
@@ -951,9 +1003,9 @@ static void state_machine_tick(void)
     case STATE_MQTT_CONNECTING:
         APP_DEBUG("[SM] sending MQTT CONNECT (id=%s)\r\n", m_cfg.client_id);
         ret = RIL_MQTT_QMTCONN(m_conn_id,
-                                m_cfg.client_id,
-                                m_cfg.user,
-                                m_cfg.pass);
+                               m_cfg.client_id,
+                               m_cfg.user,
+                               m_cfg.pass);
         if (ret == RIL_AT_SUCCESS)
         {
             m_conn_wait_ticks = 0;
@@ -968,7 +1020,8 @@ static void state_machine_tick(void)
                 m_mqtt_fail_count = 0;
                 teardown_pdp();
             }
-            else teardown_mqtt();
+            else
+                teardown_mqtt();
         }
         break;
 
@@ -983,7 +1036,8 @@ static void state_machine_tick(void)
                 m_mqtt_fail_count = 0;
                 teardown_pdp();
             }
-            else teardown_mqtt();
+            else
+                teardown_mqtt();
         }
         break;
 
@@ -1014,7 +1068,8 @@ static void state_machine_tick(void)
         break;
 
     case STATE_BACKOFF:
-        if (m_backoff_ticks > 0) m_backoff_ticks--;
+        if (m_backoff_ticks > 0)
+            m_backoff_ticks--;
         else
         {
             APP_DEBUG("[BACKOFF] done, state %d\r\n", (s32)m_backoff_next);
@@ -1030,27 +1085,30 @@ static void state_machine_tick(void)
 /*===========================================================================
  * [15] Location acquisition and MQTT publish
  *=========================================================================*/
-#define GPS_READ_ITEM  "RMC"
+#define GPS_READ_ITEM "RMC"
+#define GPS_READ_ITEM2 "GGA"
 
 static void acquire_and_send_location(void)
 {
     /* GPS */
-    s32  gps_lat_udeg = 0, gps_lng_udeg = 0;
-    bool gps_has_fix  = FALSE;
+    s32 gps_lat_udeg = 0, gps_lng_udeg = 0;
+    bool gps_has_fix = FALSE;
     char gps_lat_str[16], gps_lng_str[16];
     char gps_speed[16], gps_course[16];
+    s32 gps_sat_count = 0;   /* GGA field 7 - number of satellites in use */
+    s32 gps_fix_quality = 0; /* GGA field 6 - 0=no fix,1=GPS,2=DGPS,... */
 
     /* Cell */
-    s32  cell_lat_udeg = 0, cell_lng_udeg = 0;
-    bool cell_has_fix  = FALSE;
+    s32 cell_lat_udeg = 0, cell_lng_udeg = 0;
+    bool cell_has_fix = FALSE;
     char cell_lat_str[16], cell_lng_str[16];
 
     char ts_str[24];
     char tz_str[8];
 
-    s32  ret;
+    s32 ret;
 
-    Ql_strcpy(gps_speed,  "0.0");
+    Ql_strcpy(gps_speed, "0.0");
     Ql_strcpy(gps_course, "0.0");
 
     /* ---- GPS: read regardless of whether we'll end up using it ---- */
@@ -1064,27 +1122,30 @@ static void acquire_and_send_location(void)
         {
             char status[4], time_f[16], lat_f[16], ns[4], lon_f[16], ew[4], date_f[8];
             char speed_f[12], course_f[12];
-            while (p > (char *)m_gps_buf && *p != '$') p--;
+            while (p > (char *)m_gps_buf && *p != '$')
+                p--;
 
-            nmea_get_field(p, 1, time_f,   sizeof(time_f));
-            nmea_get_field(p, 2, status,   sizeof(status));
-            nmea_get_field(p, 3, lat_f,    sizeof(lat_f));
-            nmea_get_field(p, 4, ns,       sizeof(ns));
-            nmea_get_field(p, 5, lon_f,    sizeof(lon_f));
-            nmea_get_field(p, 6, ew,       sizeof(ew));
-            nmea_get_field(p, 7, speed_f,  sizeof(speed_f));
+            nmea_get_field(p, 1, time_f, sizeof(time_f));
+            nmea_get_field(p, 2, status, sizeof(status));
+            nmea_get_field(p, 3, lat_f, sizeof(lat_f));
+            nmea_get_field(p, 4, ns, sizeof(ns));
+            nmea_get_field(p, 5, lon_f, sizeof(lon_f));
+            nmea_get_field(p, 6, ew, sizeof(ew));
+            nmea_get_field(p, 7, speed_f, sizeof(speed_f));
             nmea_get_field(p, 8, course_f, sizeof(course_f));
-            nmea_get_field(p, 9, date_f,   sizeof(date_f));
+            nmea_get_field(p, 9, date_f, sizeof(date_f));
 
             if (status[0] == 'A')
             {
                 if (nmea_to_udeg(lat_f, &gps_lat_udeg) &&
                     nmea_to_udeg(lon_f, &gps_lng_udeg))
                 {
-                    if (ns[0] == 'S') gps_lat_udeg = -gps_lat_udeg;
-                    if (ew[0] == 'W') gps_lng_udeg = -gps_lng_udeg;
+                    if (ns[0] == 'S')
+                        gps_lat_udeg = -gps_lat_udeg;
+                    if (ew[0] == 'W')
+                        gps_lng_udeg = -gps_lng_udeg;
                     gps_has_fix = TRUE;
-                    Ql_strcpy(gps_speed,  speed_f[0]  ? speed_f  : "0.0");
+                    Ql_strcpy(gps_speed, speed_f[0] ? speed_f : "0.0");
                     Ql_strcpy(gps_course, course_f[0] ? course_f : "0.0");
                     update_gps_timestamp(time_f, date_f);
                     APP_DEBUG("[LOC] GPS fix\r\n");
@@ -1098,6 +1159,37 @@ static void acquire_and_send_location(void)
         }
     }
 
+    /* ---- GPS: read GGA sentence for satellite count / fix quality ----
+     * $GxGGA,time,lat,NS,lon,EW,quality,numSV,HDOP,alt,...
+     * field 6 = fix quality (0=invalid,1=GPS,2=DGPS,...)
+     * field 7 = number of satellites in use
+     * Read independently of RMC status - GGA can report tracked sats
+     * even while RMC status is still 'V'. */
+    Ql_memset(m_gps_buf2, 0, sizeof(m_gps_buf2));
+    ret = RIL_GPS_Read((u8 *)GPS_READ_ITEM2, m_gps_buf2);
+
+    if (ret == RIL_AT_SUCCESS && Ql_strlen((char *)m_gps_buf2) > 0)
+    {
+        char *g = Ql_strstr((char *)m_gps_buf2, "GGA");
+        if (g != NULL)
+        {
+            char quality_f[4], numsv_f[4];
+            while (g > (char *)m_gps_buf2 && *g != '$')
+                g--;
+
+            nmea_get_field(g, 6, quality_f, sizeof(quality_f));
+            nmea_get_field(g, 7, numsv_f, sizeof(numsv_f));
+
+            if (quality_f[0] != '\0')
+                gps_fix_quality = Ql_atoi(quality_f);
+            if (numsv_f[0] != '\0')
+                gps_sat_count = Ql_atoi(numsv_f);
+
+            APP_DEBUG("[LOC] GGA quality=%d sats=%d\r\n",
+                      gps_fix_quality, gps_sat_count);
+        }
+    }
+
     /* ---- Cell: always read too, independent of GPS result ---- */
     {
         ST_LocInfo cell_loc;
@@ -1106,9 +1198,9 @@ static void acquire_and_send_location(void)
         if (ret == RIL_AT_SUCCESS &&
             (cell_loc.latitude != 0.0 || cell_loc.longitude != 0.0))
         {
-            cell_lat_udeg = (s32)(cell_loc.latitude  * 1000000.0);
+            cell_lat_udeg = (s32)(cell_loc.latitude * 1000000.0);
             cell_lng_udeg = (s32)(cell_loc.longitude * 1000000.0);
-            cell_has_fix  = TRUE;
+            cell_has_fix = TRUE;
             APP_DEBUG("[LOC] cell fix\r\n");
         }
         else
@@ -1134,27 +1226,30 @@ static void acquire_and_send_location(void)
     /* gps_lat_udeg/gps_lng_udeg (or cell_*) stay 0 if that source had no
      * fix - fix flag in the payload tells the consumer whether to trust
      * the coordinates for that source. */
-    udeg_to_str(gps_lat_udeg,  gps_lat_str);
-    udeg_to_str(gps_lng_udeg,  gps_lng_str);
+    udeg_to_str(gps_lat_udeg, gps_lat_str);
+    udeg_to_str(gps_lng_udeg, gps_lng_str);
     udeg_to_str(cell_lat_udeg, cell_lat_str);
     udeg_to_str(cell_lng_udeg, cell_lng_str);
 
     get_gps_timestamp(ts_str, sizeof(ts_str), tz_str, sizeof(tz_str));
 
     m_msg_id++;
-    if (m_msg_id > 65535) m_msg_id = 1;
+    if (m_msg_id > 65535)
+        m_msg_id = 1;
 
     Ql_memset(m_payload, 0, sizeof(m_payload));
     Ql_sprintf(m_payload,
                "{\"clientId\":\"%s\","
                "\"gps_lat\":%s,\"gps_lng\":%s,\"gps_fix\":%s,"
                "\"gps_speed\":%s,\"gps_course\":%s,"
-               "\"gps_sent\":\"RMC\","
+               "\"gps_sat\":%d,\"gps_quality\":%d,"
+               "\"gps_sent\":\"RMC,GGA\","
                "\"cell_lat\":%s,\"cell_lng\":%s,\"cell_fix\":%s,"
                "\"ts\":\"%s\",\"tz\":\"%s\"}",
                (char *)m_cfg.client_id,
                gps_lat_str, gps_lng_str, gps_has_fix ? "true" : "false",
                gps_speed, gps_course,
+               gps_sat_count, gps_fix_quality,
                cell_lat_str, cell_lng_str, cell_has_fix ? "true" : "false",
                ts_str, tz_str);
 
@@ -1211,7 +1306,7 @@ void proc_main_task(s32 taskId)
 
     /* Load broker config from UFS (or fall back to defaults) */
     cfg_load();
-    rebuild_topic();   /* topic = "<user>/loc", derived from loaded config */
+    rebuild_topic(); /* topic = "<user>/loc", derived from loaded config */
 
     ret = Ql_Timer_Register(TIMER_ID_STATE_MACHINE, Timer_Callback, NULL);
     APP_DEBUG("[BOOT] state timer register, ret=%d\r\n", ret);
@@ -1319,7 +1414,7 @@ void proc_main_task(s32 taskId)
                 {
                     APP_DEBUG("[URC] +QMTCONN ok, starting publish timer\r\n");
                     m_mqtt_fail_count = 0;
-                    m_pub_fail_count  = 0;
+                    m_pub_fail_count = 0;
                     m_state = STATE_PUBLISHING;
                     Ql_Timer_Start(TIMER_ID_PUBLISH, PUBLISH_INTERVAL_MS, TRUE);
                 }
@@ -1333,7 +1428,8 @@ void proc_main_task(s32 taskId)
                         m_mqtt_fail_count = 0;
                         teardown_pdp();
                     }
-                    else teardown_mqtt();
+                    else
+                        teardown_mqtt();
                 }
                 break;
             }
@@ -1344,7 +1440,7 @@ void proc_main_task(s32 taskId)
                 if (urc != NULL && urc->result == 0)
                 {
                     APP_DEBUG("[URC] +QMTPUB ok\r\n");
-                    m_pub_fail_count  = 0;
+                    m_pub_fail_count = 0;
                     m_mqtt_fail_count = 0;
                 }
                 else
@@ -1374,10 +1470,10 @@ void proc_main_task(s32 taskId)
                 MQTT_Urc_Param_t *urc = (MQTT_Urc_Param_t *)msg.param2;
                 APP_DEBUG("[URC] +QMTCLOSE result=%d\r\n",
                           urc ? urc->result : -1);
-                if (m_state == STATE_MQTT_CLOSING       ||
-                    m_state == STATE_MQTT_DISCONNECTING  ||
-                    m_state == STATE_MQTT_OPEN_WAIT      ||
-                    m_state == STATE_MQTT_CONN_WAIT      ||
+                if (m_state == STATE_MQTT_CLOSING ||
+                    m_state == STATE_MQTT_DISCONNECTING ||
+                    m_state == STATE_MQTT_OPEN_WAIT ||
+                    m_state == STATE_MQTT_CONN_WAIT ||
                     m_state == STATE_PUBLISHING)
                 {
                     Ql_Timer_Stop(TIMER_ID_PUBLISH);
